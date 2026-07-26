@@ -9,7 +9,7 @@ local refresh = 3
 gpu.setResolution(80, 25)
 
 local function fmt(n)
-  local s = tostring(n)
+  local s = tostring(n):gsub("%.0$", "")
   while true do
     local k
     s, k = s:gsub("^(-?%d+)(%d%d%d)", "%1,%2")
@@ -25,10 +25,15 @@ while true do
     return a.size > b.size
   end)
 
+  local total = 0
+  for i = 1, #items do
+    total = total + items[i].size
+  end
+
   local w, h = gpu.getResolution()
   term.clear()
 
-  gpu.set(1, 1, ("Top RS items - refresh %ss"):format(refresh):sub(1, w))
+  gpu.set(1, 1, ("Top RS items - Total items: %s"):format(fmt(total)):sub(1, w))
 
   local colWidth = math.floor(w / 2)
   local rowsPerCol = h - 1
