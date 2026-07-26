@@ -6,6 +6,9 @@ local gpu = component.gpu
 local rs = component.block_refinedstorage_interface
 local refresh = 3
 
+-- 4 drives * 8 disks/drive * 64k per disk
+local capacity = 4 * 8 * 64000  -- 2,048,000
+
 gpu.setResolution(80, 25)
 
 local function fmt(n)
@@ -33,7 +36,10 @@ while true do
   local w, h = gpu.getResolution()
   term.clear()
 
-  gpu.set(1, 1, ("Top RS items - Total items: %s"):format(fmt(total)):sub(1, w))
+  local header = ("Top RS items - Used: %s / %s items (%.1f%%)")
+    :format(fmt(total), fmt(capacity), (total / capacity) * 100)
+
+  gpu.set(1, 1, header:sub(1, w))
 
   local colWidth = math.floor(w / 2)
   local rowsPerCol = h - 1
