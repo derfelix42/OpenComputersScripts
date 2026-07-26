@@ -42,7 +42,7 @@ while true do
   local colWidth = math.floor(w / 2)
   local rowsPerCol = h - 1
   local numWidth = 8
-  local nameWidth = colWidth - numWidth - 5
+  local nameWidth = colWidth - numWidth - 6
 
   for i = 1, math.min(#items, rowsPerCol * 2) do
     local stack = items[i]
