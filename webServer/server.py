@@ -9,6 +9,7 @@ from typing import List, Optional
 import datetime
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 
@@ -168,9 +169,9 @@ def get_report() -> dict:
 
 
 @app.get("/")
-def dashboard() -> str:
+def dashboard() -> HTMLResponse:
     """Serve the simple HTML dashboard."""
-    return DASHBOARD_HTML
+    return HTMLResponse(content=DASHBOARD_HTML)
 
 
 def _current_report_updated_iso() -> str:
