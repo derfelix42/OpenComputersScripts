@@ -4,7 +4,7 @@ local event = require("event")
 local gpu = component.gpu
 
 local internet = require("internet")
-local pushUrl = "http://http://vpn.stevegame.de:8000/api/rs"
+local pushUrl = "http://vpn.stevegame.de:8000/api/rs"
 
 local rs = component.block_refinedstorage_interface
 local refresh = 3
