@@ -30,6 +30,13 @@ app = FastAPI(title="OpenComputers Item Dashboard")
 _current_report: Optional[ItemReport] = None
 _report_received_at: Optional[datetime.datetime] = None
 
+# Storage capacity: 4 * 8 * 65536 = 2,097,152 item slots.
+STORAGE_MAX = 4 * 8 * 65536
+
+# Rolling history of total item counts. Capped to avoid unbounded growth.
+_history: List[dict] = []
+_HISTORY_MAX = 500
+
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -66,6 +73,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     height: 6px; background: #eef; border-radius: 3px; margin-top: 4px; overflow: hidden;
   }
   .bar > span { display: block; height: 100%; background: #6366f1; }
+  .fill-bar {
+    height: 10px; background: #eef; border-radius: 5px; margin-top: 6px; overflow: hidden;
+  }
+  .fill-bar > span { display: block; height: 100%; background: #22c55e; transition: width 0.3s; }
+  .chart-card {
+    background: #fff; border: 1px solid #e3e3e8; border-radius: 8px;
+    padding: 1rem 1.25rem; margin-bottom: 1.5rem; box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  }
+  .chart-card h2 { margin: 0 0 0.75rem; font-size: 1rem; text-transform: uppercase; color: #6b7280; }
+  .chart-wrap { position: relative; height: 240px; }
 </style>
 </head>
 <body>
@@ -83,6 +100,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="label">Last Update</div>
       <div class="value" id="updated">-</div>
     </div>
+    <div class="card">
+      <div class="label">Storage Fill</div>
+      <div class="value" id="fill">-</div>
+      <div class="fill-bar"><span id="fill-bar" style="width:0%"></span></div>
+    </div>
+  </div>
+  <div class="chart-card">
+    <h2>Total Items Over Time</h2>
+    <div class="chart-wrap"><canvas id="historyChart"></canvas></div>
   </div>
   <table>
     <thead>
@@ -94,13 +120,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </table>
   <div class="updated" id="fetched"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <script>
+let historyChart = null;
+
 async function refresh() {
   try {
     const res = await fetch('/api/rs');
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     render(data);
+    refreshHistory();
   } catch (e) {
     document.getElementById('fetched').textContent = 'Fetch error: ' + e.message;
   }
@@ -112,6 +142,10 @@ function render(data) {
   document.getElementById('total').textContent = total.toLocaleString();
   document.getElementById('types').textContent = items.length.toLocaleString();
   document.getElementById('updated').textContent = data.updated || '-';
+  const storageMax = data.storage_max || 1;
+  const fillPct = data.fill_percent != null ? data.fill_percent : (total / storageMax * 100);
+  document.getElementById('fill').textContent = fillPct.toFixed(2) + '%';
+  document.getElementById('fill-bar').style.width = Math.min(100, fillPct) + '%';
 
   const rows = document.getElementById('rows');
   if (items.length === 0) {
@@ -131,6 +165,51 @@ function render(data) {
     </tr>`;
   }).join('');
   document.getElementById('fetched').textContent = 'Updated ' + new Date().toLocaleTimeString();
+}
+
+async function refreshHistory() {
+  try {
+    const res = await fetch('/api/history');
+    if (!res.ok) return;
+    const data = await res.json();
+    renderChart(data.points || []);
+  } catch (e) { /* ignore chart errors */ }
+}
+
+function renderChart(points) {
+  const labels = points.map(p => new Date(p.t).toLocaleTimeString());
+  const totals = points.map(p => p.total);
+  const ctx = document.getElementById('historyChart').getContext('2d');
+  if (historyChart) {
+    historyChart.data.labels = labels;
+    historyChart.data.datasets[0].data = totals;
+    historyChart.update('none');
+    return;
+  }
+  historyChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [{
+        label: 'Total Items',
+        data: totals,
+        borderColor: '#6366f1',
+        backgroundColor: 'rgba(99,102,241,0.1)',
+        fill: true,
+        tension: 0.3,
+        pointRadius: 2,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        y: { beginAtZero: true },
+        x: { ticks: { maxTicksLimit: 8 } }
+      },
+      plugins: { legend: { display: false } }
+    }
+  });
 }
 
 function escapeHtml(s) {
@@ -153,6 +232,9 @@ def receive_report(report: ItemReport) -> dict:
     global _current_report, _report_received_at
     _current_report = report
     _report_received_at = datetime.datetime.now(datetime.timezone.utc)
+    _history.append({"t": _report_received_at.isoformat(), "total": report.total})
+    if len(_history) > _HISTORY_MAX:
+        del _history[: len(_history) - _HISTORY_MAX]
     return {"status": "ok", "items": len(report.items), "total": report.total}
 
 
@@ -165,7 +247,15 @@ def get_report() -> dict:
         "total": _current_report.total,
         "items": [item.model_dump() for item in _current_report.items],
         "updated": _current_report_updated_iso(),
+        "fill_percent": round(_current_report.total / STORAGE_MAX * 100, 2),
+        "storage_max": STORAGE_MAX,
     }
+
+
+@app.get("/api/history")
+def get_history() -> dict:
+    """Return the rolling history of total item counts."""
+    return {"points": _history, "storage_max": STORAGE_MAX}
 
 
 @app.get("/")
