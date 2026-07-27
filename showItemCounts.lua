@@ -32,10 +32,12 @@ local function jsonEscape(s)
   return s
 end
 
-local function pushItems(items, total)
+local function pushItems(items, total, craftableCount)
   local parts = {}
 
-  parts[#parts + 1] = '{"total":' .. math.floor(total) .. ',"items":['
+  parts[#parts + 1] = '{"total":' .. math.floor(total) ..
+    ',"craftable_count":' .. math.floor(craftableCount) ..
+    ',"items":['
 
   for i = 1, #items do
     local stack = items[i]
@@ -43,10 +45,13 @@ local function pushItems(items, total)
       parts[#parts + 1] = ","
     end
 
+    local craftable = stack.craftable and "true" or "false"
+
     parts[#parts + 1] =
       '{"name":"' .. jsonEscape(stack.name) ..
       '","label":"' .. jsonEscape(stack.label or stack.name) ..
       '","size":' .. math.floor(tonumber(stack.size) or 0) ..
+      ',"craftable":' .. craftable ..
       '}'
   end
 
@@ -70,6 +75,40 @@ end
 while true do
   local items = rs.getItems()
 
+  -- Fetch crafting patterns and build a set of craftable item names.
+  -- The exact structure of getPatterns() is uncertain, so we defensively
+  -- extract the output item's name from common field locations.
+  local craftableNames = {}
+  local craftableCount = 0
+  local okPatterns, patterns = pcall(rs.getPatterns)
+  if okPatterns and patterns then
+    for i = 1, #patterns do
+      local p = patterns[i]
+      -- Each pattern has an "outputs" array of output itemstacks.
+      local outputs = p.outputs
+      if type(outputs) == "table" then
+        for j = 1, #outputs do
+          local out = outputs[j]
+          local name = nil
+          if type(out) == "table" then
+            name = out.name or out.id
+          elseif type(out) == "string" then
+            name = out
+          end
+          if name and not craftableNames[name] then
+            craftableNames[name] = true
+            craftableCount = craftableCount + 1
+          end
+        end
+      end
+    end
+  end
+
+  -- Mark each item as craftable if a pattern exists for it.
+  for i = 1, #items do
+    items[i].craftable = craftableNames[items[i].name] == true
+  end
+
   table.sort(items, function(a, b)
     return a.size > b.size
   end)
@@ -79,7 +118,7 @@ while true do
     total = total + items[i].size
   end
 
-  pushItems(items, total)
+  pushItems(items, total, craftableCount)
 
   local w, h = gpu.getResolution()
   term.clear()

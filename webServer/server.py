@@ -19,10 +19,12 @@ class Item(BaseModel):
     name: str
     label: str
     size: int
+    craftable: bool = False
 
 
 class ItemReport(BaseModel):
     total: int
+    craftable_count: int = 0
     items: List[Item]
 
 
@@ -49,6 +51,7 @@ def _init_db() -> None:
             CREATE TABLE IF NOT EXISTS current_state (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 total INTEGER NOT NULL,
+                craftable_count INTEGER NOT NULL DEFAULT 0,
                 items_json TEXT NOT NULL,
                 updated TEXT NOT NULL
             )
@@ -65,6 +68,19 @@ def _init_db() -> None:
 
 
 _init_db()
+
+
+def _migrate_db() -> None:
+    """Add columns that may be missing in older database files."""
+    with _get_db() as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(current_state)")}
+        if "craftable_count" not in cols:
+            conn.execute(
+                "ALTER TABLE current_state ADD COLUMN craftable_count INTEGER NOT NULL DEFAULT 0"
+            )
+
+
+_migrate_db()
 
 
 def _compress_history(conn: sqlite3.Connection) -> None:
@@ -179,6 +195,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .range-buttons button.active {
     background: #6366f1; color: #fff; border-color: #6366f1;
   }
+  .filter-bar { margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }
+  .filter-bar label { font-size: 0.85rem; color: #6b7280; cursor: pointer; }
+  .craftable-yes { color: #22c55e; font-weight: 600; }
+  .craftable-no { color: #d1d5db; }
 </style>
 </head>
 <body>
@@ -201,6 +221,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="value" id="fill">-</div>
       <div class="fill-bar"><span id="fill-bar" style="width:0%"></span></div>
     </div>
+    <div class="card">
+      <div class="label">Craftable Types</div>
+      <div class="value" id="craftable">-</div>
+    </div>
   </div>
   <div class="chart-card">
     <h2>Total Items Over Time</h2>
@@ -211,12 +235,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div class="chart-wrap"><canvas id="historyChart"></canvas></div>
   </div>
+  <div class="filter-bar">
+    <label><input type="checkbox" id="craftableOnly"> Show craftable only</label>
+  </div>
   <table>
     <thead>
-      <tr><th>Label</th><th>Name</th><th>Size</th><th>Share</th></tr>
+      <tr><th>Label</th><th>Name</th><th>Size</th><th>Share</th><th>Craft</th></tr>
     </thead>
     <tbody id="rows">
-      <tr><td colspan="4" class="empty">Waiting for data...</td></tr>
+      <tr><td colspan="5" class="empty">Waiting for data...</td></tr>
     </tbody>
   </table>
   <div class="updated" id="fetched"></div>
@@ -227,6 +254,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <script>
 let historyChart = null;
 let currentRange = '24h';
+let craftableOnly = false;
 
 function formatDateTime(iso) {
   if (!iso) return '-';
@@ -262,15 +290,20 @@ function render(data) {
   const fillPct = data.fill_percent != null ? data.fill_percent : (total / storageMax * 100);
   document.getElementById('fill').textContent = fillPct.toFixed(2) + '%';
   document.getElementById('fill-bar').style.width = Math.min(100, fillPct) + '%';
+  document.getElementById('craftable').textContent = (data.craftable_count || 0).toLocaleString();
 
   const rows = document.getElementById('rows');
-  if (items.length === 0) {
-    rows.innerHTML = '<tr><td colspan="4" class="empty">No items reported.</td></tr>';
+  const visible = craftableOnly ? items.filter(it => it.craftable) : items;
+  if (visible.length === 0) {
+    rows.innerHTML = '<tr><td colspan="5" class="empty">No items reported.</td></tr>';
     return;
   }
-  rows.innerHTML = items.map(it => {
+  rows.innerHTML = visible.map(it => {
     const share = total > 0 ? (it.size / total * 100).toFixed(1) : '0.0';
     const width = total > 0 ? Math.max(1, it.size / total * 100) : 0;
+    const craft = it.craftable
+      ? '<span class="craftable-yes">✓</span>'
+      : '<span class="craftable-no">✗</span>';
     return `<tr>
       <td>${escapeHtml(it.label)}</td>
       <td><code>${escapeHtml(it.name)}</code></td>
@@ -278,6 +311,7 @@ function render(data) {
       <td>${share}%
         <div class="bar"><span style="width:${width}%"></span></div>
       </td>
+      <td>${craft}</td>
     </tr>`;
   }).join('');
   document.getElementById('fetched').textContent = 'Updated ' + new Date().toLocaleTimeString();
@@ -347,6 +381,11 @@ document.querySelectorAll('.range-buttons button').forEach(btn => {
   });
 });
 
+document.getElementById('craftableOnly').addEventListener('change', e => {
+  craftableOnly = e.target.checked;
+  refresh();
+});
+
 refresh();
 setInterval(refresh, 5000);
 </script>
@@ -366,14 +405,15 @@ def receive_report(report: ItemReport) -> dict:
     with _get_db() as conn:
         conn.execute(
             """
-            INSERT INTO current_state (id, total, items_json, updated)
-            VALUES (1, ?, ?, ?)
+            INSERT INTO current_state (id, total, craftable_count, items_json, updated)
+            VALUES (1, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 total = excluded.total,
+                craftable_count = excluded.craftable_count,
                 items_json = excluded.items_json,
                 updated = excluded.updated
             """,
-            (report.total, items_json, now_iso),
+            (report.total, report.craftable_count, items_json, now_iso),
         )
         conn.execute(
             "INSERT OR REPLACE INTO history (ts, total) VALUES (?, ?)",
@@ -388,12 +428,13 @@ def receive_report(report: ItemReport) -> dict:
 def get_report() -> dict:
     """Return the currently stored item report, or 404 if none yet."""
     with _get_db() as conn:
-        row = conn.execute("SELECT total, items_json, updated FROM current_state WHERE id = 1").fetchone()
+        row = conn.execute("SELECT total, craftable_count, items_json, updated FROM current_state WHERE id = 1").fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="No report has been posted yet.")
     items = json.loads(row["items_json"])
     return {
         "total": row["total"],
+        "craftable_count": row["craftable_count"],
         "items": items,
         "updated": row["updated"],
         "fill_percent": round(row["total"] / STORAGE_MAX * 100, 2),
