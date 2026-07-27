@@ -1,14 +1,16 @@
 """Basic FastAPI server that stores item counts posted from OpenComputers.
 
 Run with:
-    uvicorn server:app --reload --port 8000
+    uvicorn server:app --reload --host 0.0.0.0 --port 8000
 """
 
-from typing import List, Optional
-
 import datetime
+import json
+import sqlite3
+from pathlib import Path
+from typing import List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -26,16 +28,102 @@ class ItemReport(BaseModel):
 
 app = FastAPI(title="OpenComputers Item Dashboard")
 
-# In-memory storage. Replaced on every POST. Not persisted across restarts.
-_current_report: Optional[ItemReport] = None
-_report_received_at: Optional[datetime.datetime] = None
-
 # Storage capacity: 4 * 8 * 65536 = 2,097,152 item slots.
 STORAGE_MAX = 4 * 8 * 65536
 
-# Rolling history of total item counts. Capped to avoid unbounded growth.
-_history: List[dict] = []
-_HISTORY_MAX = 500
+# SQLite database next to this file.
+DB_PATH = Path(__file__).resolve().parent / "data.db"
+
+
+def _get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def _init_db() -> None:
+    with _get_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS current_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                total INTEGER NOT NULL,
+                items_json TEXT NOT NULL,
+                updated TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS history (
+                ts INTEGER PRIMARY KEY,
+                total INTEGER NOT NULL
+            )
+            """
+        )
+
+
+_init_db()
+
+
+def _compress_history(conn: sqlite3.Connection) -> None:
+    """Compress history into tiers and prune old data.
+
+    Tiers:
+      - Raw data (every POST): keep for the last 1 hour.
+      - 1-minute buckets: for data between 1h and 24h old.
+      - 10-minute buckets: for data between 24h and 7d old.
+      - Delete anything older than 7 days.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    epoch = int(now.timestamp())
+    one_hour = 3600
+    one_day = 86400
+    seven_days = 604800
+
+    raw_cutoff = epoch - one_hour
+    min_cutoff = epoch - one_day
+    day_cutoff = epoch - seven_days
+
+    # Compress 1h..24h into 1-minute buckets (keep the last sample of each bucket).
+    conn.execute(
+        """
+        DELETE FROM history
+        WHERE ts IN (
+            SELECT ts FROM history h1
+            WHERE h1.ts <= ? AND h1.ts > ?
+              AND EXISTS (
+                  SELECT 1 FROM history h2
+                  WHERE h2.ts <= ? AND h2.ts > ?
+                    AND (h2.ts / 60) = (h1.ts / 60)
+                    AND h2.ts > h1.ts
+              )
+        )
+        """,
+        (raw_cutoff, min_cutoff, raw_cutoff, min_cutoff),
+    )
+
+    # Compress 24h..7d into 10-minute buckets (keep the last sample of each bucket).
+    conn.execute(
+        """
+        DELETE FROM history
+        WHERE ts IN (
+            SELECT ts FROM history h1
+            WHERE h1.ts <= ? AND h1.ts > ?
+              AND EXISTS (
+                  SELECT 1 FROM history h2
+                  WHERE h2.ts <= ? AND h2.ts > ?
+                    AND (h2.ts / 600) = (h1.ts / 600)
+                    AND h2.ts > h1.ts
+              )
+        )
+        """,
+        (min_cutoff, day_cutoff, min_cutoff, day_cutoff),
+    )
+
+    # Delete anything older than 7 days.
+    conn.execute("DELETE FROM history WHERE ts <= ?", (day_cutoff,))
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -83,6 +171,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
   .chart-card h2 { margin: 0 0 0.75rem; font-size: 1rem; text-transform: uppercase; color: #6b7280; }
   .chart-wrap { position: relative; height: 240px; }
+  .range-buttons { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }
+  .range-buttons button {
+    border: 1px solid #d1d5db; background: #fff; border-radius: 6px;
+    padding: 0.3rem 0.8rem; cursor: pointer; font-size: 0.85rem;
+  }
+  .range-buttons button.active {
+    background: #6366f1; color: #fff; border-color: #6366f1;
+  }
 </style>
 </head>
 <body>
@@ -108,6 +204,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
   <div class="chart-card">
     <h2>Total Items Over Time</h2>
+    <div class="range-buttons">
+      <button data-range="1h">1h</button>
+      <button data-range="24h" class="active">24h</button>
+      <button data-range="7d">7d</button>
+    </div>
     <div class="chart-wrap"><canvas id="historyChart"></canvas></div>
   </div>
   <table>
@@ -123,10 +224,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <script>
 let historyChart = null;
+let currentRange = '24h';
+
+function formatDateTime(iso) {
+  if (!iso) return '-';
+  const d = new Date(iso);
+  const pad = n => String(n).padStart(2, '0');
+  return pad(d.getDate()) + '.' + pad(d.getMonth() + 1) + '.' + d.getFullYear()
+    + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+}
 
 async function refresh() {
   try {
     const res = await fetch('/api/rs');
+    if (res.status === 404) {
+      document.getElementById('fetched').textContent = 'No data posted yet.';
+      return;
+    }
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     render(data);
@@ -141,7 +255,7 @@ function render(data) {
   const items = data.items || [];
   document.getElementById('total').textContent = total.toLocaleString();
   document.getElementById('types').textContent = items.length.toLocaleString();
-  document.getElementById('updated').textContent = data.updated || '-';
+  document.getElementById('updated').textContent = formatDateTime(data.updated);
   const storageMax = data.storage_max || 1;
   const fillPct = data.fill_percent != null ? data.fill_percent : (total / storageMax * 100);
   document.getElementById('fill').textContent = fillPct.toFixed(2) + '%';
@@ -169,7 +283,7 @@ function render(data) {
 
 async function refreshHistory() {
   try {
-    const res = await fetch('/api/history');
+    const res = await fetch('/api/history?range=' + encodeURIComponent(currentRange));
     if (!res.ok) return;
     const data = await res.json();
     renderChart(data.points || []);
@@ -177,7 +291,7 @@ async function refreshHistory() {
 }
 
 function renderChart(points) {
-  const labels = points.map(p => new Date(p.t).toLocaleTimeString());
+  const labels = points.map(p => formatDateTime(p.t));
   const totals = points.map(p => p.total);
   const ctx = document.getElementById('historyChart').getContext('2d');
   if (historyChart) {
@@ -218,6 +332,15 @@ function escapeHtml(s) {
   }[c]));
 }
 
+document.querySelectorAll('.range-buttons button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.range-buttons button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentRange = btn.dataset.range;
+    refreshHistory();
+  });
+});
+
 refresh();
 setInterval(refresh, 5000);
 </script>
@@ -229,42 +352,68 @@ setInterval(refresh, 5000);
 @app.post("/api/rs")
 def receive_report(report: ItemReport) -> dict:
     """Store the latest item report. Overwrites any previous data."""
-    global _current_report, _report_received_at
-    _current_report = report
-    _report_received_at = datetime.datetime.now(datetime.timezone.utc)
-    _history.append({"t": _report_received_at.isoformat(), "total": report.total})
-    if len(_history) > _HISTORY_MAX:
-        del _history[: len(_history) - _HISTORY_MAX]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    now_iso = now.isoformat()
+    now_epoch = int(now.timestamp())
+    items_json = json.dumps([item.model_dump() for item in report.items])
+
+    with _get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO current_state (id, total, items_json, updated)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                total = excluded.total,
+                items_json = excluded.items_json,
+                updated = excluded.updated
+            """,
+            (report.total, items_json, now_iso),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO history (ts, total) VALUES (?, ?)",
+            (now_epoch, report.total),
+        )
+        _compress_history(conn)
+
     return {"status": "ok", "items": len(report.items), "total": report.total}
 
 
 @app.get("/api/rs")
 def get_report() -> dict:
     """Return the currently stored item report, or 404 if none yet."""
-    if _current_report is None:
+    with _get_db() as conn:
+        row = conn.execute("SELECT total, items_json, updated FROM current_state WHERE id = 1").fetchone()
+    if row is None:
         raise HTTPException(status_code=404, detail="No report has been posted yet.")
+    items = json.loads(row["items_json"])
     return {
-        "total": _current_report.total,
-        "items": [item.model_dump() for item in _current_report.items],
-        "updated": _current_report_updated_iso(),
-        "fill_percent": round(_current_report.total / STORAGE_MAX * 100, 2),
+        "total": row["total"],
+        "items": items,
+        "updated": row["updated"],
+        "fill_percent": round(row["total"] / STORAGE_MAX * 100, 2),
         "storage_max": STORAGE_MAX,
     }
 
 
 @app.get("/api/history")
-def get_history() -> dict:
-    """Return the rolling history of total item counts."""
-    return {"points": _history, "storage_max": STORAGE_MAX}
+def get_history(range: str = Query("24h", pattern="^(1h|24h|7d)$")) -> dict:
+    """Return history points for the requested time range."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    epoch = int(now.timestamp())
+    cutoffs = {"1h": 3600, "24h": 86400, "7d": 604800}
+    cutoff = epoch - cutoffs[range]
+
+    with _get_db() as conn:
+        rows = conn.execute(
+            "SELECT ts, total FROM history WHERE ts > ? ORDER BY ts ASC",
+            (cutoff,),
+        ).fetchall()
+
+    points = [{"t": datetime.datetime.fromtimestamp(r["ts"], tz=datetime.timezone.utc).isoformat(), "total": r["total"]} for r in rows]
+    return {"points": points, "storage_max": STORAGE_MAX}
 
 
 @app.get("/")
 def dashboard() -> HTMLResponse:
     """Serve the simple HTML dashboard."""
     return HTMLResponse(content=DASHBOARD_HTML)
-
-
-def _current_report_updated_iso() -> str:
-    if _report_received_at is None:
-        return ""
-    return _report_received_at.isoformat()
