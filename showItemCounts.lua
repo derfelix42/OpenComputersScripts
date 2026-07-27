@@ -3,6 +3,9 @@ local term = require("term")
 local event = require("event")
 local gpu = component.gpu
 
+local internet = require("internet")
+local pushUrl = "http://http://vpn.stevegame.de:8000/api/rs"
+
 local rs = component.block_refinedstorage_interface
 local refresh = 3
 
@@ -20,6 +23,50 @@ local function fmt(n)
   return s
 end
 
+local function jsonEscape(s)
+  s = tostring(s or "")
+  s = s:gsub("\\", "\\\\")
+  s = s:gsub('"', '\\"')
+  s = s:gsub("\n", "\\n")
+  s = s:gsub("\r", "\\r")
+  return s
+end
+
+local function pushItems(items, total)
+  local parts = {}
+
+  parts[#parts + 1] = '{"total":' .. math.floor(total) .. ',"items":['
+
+  for i = 1, #items do
+    local stack = items[i]
+    if i > 1 then
+      parts[#parts + 1] = ","
+    end
+
+    parts[#parts + 1] =
+      '{"name":"' .. jsonEscape(stack.name) ..
+      '","label":"' .. jsonEscape(stack.label or stack.name) ..
+      '","size":' .. math.floor(tonumber(stack.size) or 0) ..
+      '}'
+  end
+
+  parts[#parts + 1] = "]}"
+
+  local body = table.concat(parts)
+
+  local ok, req = pcall(
+    internet.request,
+    pushUrl,
+    body,
+    {["Content-Type"] = "application/json"},
+    "POST"
+  )
+
+  if ok and req then
+    for _ in req do break end
+  end
+end
+
 while true do
   local items = rs.getItems()
 
@@ -31,6 +78,8 @@ while true do
   for i = 1, #items do
     total = total + items[i].size
   end
+
+  pushItems(items, total)
 
   local w, h = gpu.getResolution()
   term.clear()
