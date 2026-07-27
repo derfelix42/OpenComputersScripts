@@ -222,6 +222,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="updated" id="fetched"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="https://cdn.jsdelivr.net/npm/luxon@3"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1"></script>
 <script>
 let historyChart = null;
 let currentRange = '24h';
@@ -286,27 +288,27 @@ async function refreshHistory() {
     const res = await fetch('/api/history?range=' + encodeURIComponent(currentRange));
     if (!res.ok) return;
     const data = await res.json();
-    renderChart(data.points || []);
+    renderChart(data.points || [], data.storage_max || 0);
   } catch (e) { /* ignore chart errors */ }
 }
 
-function renderChart(points) {
-  const labels = points.map(p => formatDateTime(p.t));
-  const totals = points.map(p => p.total);
+function renderChart(points, storageMax) {
+  const data = points.map(p => ({ x: p.t, y: p.total }));
   const ctx = document.getElementById('historyChart').getContext('2d');
+  const timeUnit = currentRange === '1h' ? 'minute' : currentRange === '24h' ? 'hour' : 'day';
   if (historyChart) {
-    historyChart.data.labels = labels;
-    historyChart.data.datasets[0].data = totals;
+    historyChart.data.datasets[0].data = data;
+    historyChart.options.scales.x.time.unit = timeUnit;
+    if (storageMax) historyChart.options.scales.y.max = storageMax;
     historyChart.update('none');
     return;
   }
   historyChart = new Chart(ctx, {
     type: 'line',
     data: {
-      labels: labels,
       datasets: [{
         label: 'Total Items',
-        data: totals,
+        data: data,
         borderColor: '#6366f1',
         backgroundColor: 'rgba(99,102,241,0.1)',
         fill: true,
@@ -318,8 +320,12 @@ function renderChart(points) {
       responsive: true,
       maintainAspectRatio: false,
       scales: {
-        y: { beginAtZero: true },
-        x: { ticks: { maxTicksLimit: 8 } }
+        y: { beginAtZero: true, max: storageMax || undefined },
+        x: {
+          type: 'time',
+          time: { unit: timeUnit },
+          ticks: { maxTicksLimit: 8 }
+        }
       },
       plugins: { legend: { display: false } }
     }
